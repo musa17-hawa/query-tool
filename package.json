@@ -1,0 +1,13 @@
+{
+  "name": "data-query-tool",
+  "version": "1.0.0",
+  "description": "Parse data files (XLSX, CSV, XML, JSON, SQLite) and run SQL queries with a ServiceNow-style filter builder",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
