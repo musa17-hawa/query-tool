@@ -35,6 +35,13 @@
   const langAllBtn    = $('lang-all');
   const langEnBtn     = $('lang-en');
   const langHeBtn     = $('lang-he');
+  const resultsTips   = $('results-tips');
+  const cardModal     = $('card-modal');
+  const cardModalBody = $('card-modal-body');
+  const cardModalClose= $('card-modal-close');
+  const cardModalPrev = $('card-modal-prev');
+  const cardModalNext = $('card-modal-next');
+  const cardModalCount= $('card-modal-counter');
 
   // ---------- state ----------------------------------------------------
   let activeTable = null;
@@ -44,6 +51,8 @@
   let sortState = { col: null, dir: null }; // dir: 'asc' | 'desc' | null
   let viewMode = 'table';      // 'table' | 'cards'
   let languageFilter = 'all';  // 'all' | 'english' | 'hebrew'
+  let columnOrder = [];        // display order of columns (array of column names)
+  let modalRowIndex = -1;      // index into sorted rows for the currently-open detail
 
   // ---------- query builder instance -----------------------------------
   const qb = new QueryBuilder(filterHost, { onChange: refreshSql });
@@ -74,6 +83,7 @@
     lastResult = null;
     selectedCols = [];
     sortState = { col: null, dir: null };
+    columnOrder = [];
     languageFilter = 'all';
     langAllBtn.classList.add('active');
     langEnBtn.classList.remove('active');
@@ -354,6 +364,7 @@
         const res = DataDB.run(sql);
         lastResult = res;
         sortState = { col: null, dir: null }; // fresh query -> unsorted
+        columnOrder = res.columns.slice();    // fresh query -> reset to natural order
         renderResults();
         resultMeta.textContent = `${res.rowCount.toLocaleString()} row${res.rowCount !== 1 ? 's' : ''}` +
                                  (res.ms ? ` in ${res.ms.toFixed(1)}ms` : '');
@@ -382,17 +393,23 @@
   function renderResults() {
     if (!lastResult) {
       resultsHost.innerHTML = '<p class="empty-hint">No query run yet. Build a filter above and hit <strong>Run query</strong>.</p>';
+      resultsTips.hidden = true;
       return;
     }
     const res = lastResult;
     if (!res.columns.length) {
       resultsHost.innerHTML = '<p class="empty-hint">Statement executed — no result set returned.</p>';
+      resultsTips.hidden = true;
       return;
     }
     if (!res.rows.length) {
       resultsHost.innerHTML = '<p class="empty-hint">No rows matched.</p>';
+      resultsTips.hidden = true;
       return;
     }
+    // Tip line: visible only when we actually have rows on screen.
+    resultsTips.hidden = false;
+    resultsTips.dataset.mode = viewMode;
     const rows = sortedRows(res);
     resultsHost.innerHTML = '';
     if (viewMode === 'cards') {
@@ -426,45 +443,138 @@
     return String(a).localeCompare(String(b), undefined, { numeric: true, sensitivity: 'base' });
   }
 
+  // Resolve the display order. Returns an array of {name, srcIdx} where
+  // srcIdx is the column's original index inside res.columns (which is what
+  // each row tuple is keyed by). Falls back to natural order if columnOrder
+  // is stale (e.g. a column was renamed between queries).
+  function orderedColumns(srcColumns) {
+    const seen = new Set();
+    const out = [];
+    for (const name of columnOrder) {
+      const idx = srcColumns.indexOf(name);
+      if (idx >= 0 && !seen.has(name)) {
+        out.push({ name, srcIdx: idx });
+        seen.add(name);
+      }
+    }
+    // Append any columns missing from columnOrder (defensive).
+    srcColumns.forEach((name, idx) => {
+      if (!seen.has(name)) out.push({ name, srcIdx: idx });
+    });
+    return out;
+  }
+
   function renderTable(columns, rows) {
     const table = document.createElement('table');
     table.className = 'results-table';
 
+    const display = orderedColumns(columns);
     const thead = document.createElement('thead');
     const trh = document.createElement('tr');
-    columns.forEach((c) => {
+
+    // Track whether a real drag happened, so we don't sort after a drop.
+    let dragSource = null;
+    let dragMoved  = false;
+
+    display.forEach(({ name }, displayIdx) => {
       const th = document.createElement('th');
-      th.className = 'sortable';
-      const isSorted = sortState.col === c;
+      th.className = 'sortable draggable-th';
+      th.draggable = true;
+      th.dataset.col = name;
+      th.dataset.displayIdx = String(displayIdx);
+
+      const isSorted = sortState.col === name;
       if (isSorted) th.classList.add('sorted-' + sortState.dir);
+
+      // grip icon (visual affordance for drag)
+      const grip = document.createElement('span');
+      grip.className = 'th-grip';
+      grip.setAttribute('aria-hidden', 'true');
+      grip.innerHTML = '⋮⋮';
 
       const label = document.createElement('span');
       label.className = 'th-label';
-      label.textContent = c;
+      label.textContent = name;
 
       const indicator = document.createElement('span');
       indicator.className = 'sort-indicator';
       indicator.textContent = isSorted ? (sortState.dir === 'asc' ? '▲' : '▼') : '↕';
 
-      th.append(label, indicator);
-      th.title = 'Click to sort by ' + c;
+      th.append(grip, label, indicator);
+      th.title = `Click to sort by ${name}  •  Drag to reorder`;
+
+      // ---- click -> sort (suppressed if a drag just happened) ----
       th.addEventListener('click', () => {
-        // none -> asc -> desc -> none (cycle on same column)
-        if (sortState.col !== c) { sortState = { col: c, dir: 'asc' }; }
-        else if (sortState.dir === 'asc')  { sortState = { col: c, dir: 'desc' }; }
-        else if (sortState.dir === 'desc') { sortState = { col: null, dir: null }; }
-        else                                { sortState = { col: c, dir: 'asc' }; }
+        if (dragMoved) return;
+        if (sortState.col !== name)         sortState = { col: name, dir: 'asc' };
+        else if (sortState.dir === 'asc')   sortState = { col: name, dir: 'desc' };
+        else if (sortState.dir === 'desc')  sortState = { col: null, dir: null };
+        else                                sortState = { col: name, dir: 'asc' };
         renderResults();
       });
+
+      // ---- drag start ----
+      th.addEventListener('dragstart', (e) => {
+        dragSource = name;
+        dragMoved  = false;
+        th.classList.add('dragging');
+        try {
+          e.dataTransfer.effectAllowed = 'move';
+          e.dataTransfer.setData('text/plain', name);
+        } catch (_) {}
+      });
+
+      // ---- drag over (allow drop + show insertion indicator) ----
+      th.addEventListener('dragover', (e) => {
+        if (!dragSource || dragSource === name) return;
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'move';
+        dragMoved = true;
+        // Insert before this column if cursor on left half, otherwise after.
+        const rect = th.getBoundingClientRect();
+        const before = (e.clientX - rect.left) < rect.width / 2;
+        // Clear other indicators
+        trh.querySelectorAll('.drop-before, .drop-after').forEach((el) => {
+          el.classList.remove('drop-before', 'drop-after');
+        });
+        th.classList.add(before ? 'drop-before' : 'drop-after');
+      });
+
+      th.addEventListener('dragleave', () => {
+        th.classList.remove('drop-before', 'drop-after');
+      });
+
+      // ---- drop ----
+      th.addEventListener('drop', (e) => {
+        if (!dragSource || dragSource === name) return;
+        e.preventDefault();
+        const rect = th.getBoundingClientRect();
+        const before = (e.clientX - rect.left) < rect.width / 2;
+        moveColumn(dragSource, name, before);
+        renderResults();
+      });
+
+      // ---- drag end (cleanup) ----
+      th.addEventListener('dragend', () => {
+        th.classList.remove('dragging');
+        trh.querySelectorAll('.drop-before, .drop-after, .dragging').forEach((el) => {
+          el.classList.remove('drop-before', 'drop-after', 'dragging');
+        });
+        // Reset flag after this tick so any spurious click can read it first.
+        setTimeout(() => { dragSource = null; dragMoved = false; }, 0);
+      });
+
       trh.appendChild(th);
     });
     thead.appendChild(trh);
     table.appendChild(thead);
 
     const tbody = document.createElement('tbody');
-    rows.forEach((r) => {
+    rows.forEach((r, rowIdx) => {
       const tr = document.createElement('tr');
-      r.forEach((v) => {
+      tr.dataset.rowIdx = String(rowIdx);
+      display.forEach(({ srcIdx }) => {
+        const v = r[srcIdx];
         const td = document.createElement('td');
         if (v === null || v === undefined) {
           td.textContent = 'NULL';
@@ -475,10 +585,36 @@
         }
         tr.appendChild(td);
       });
+      // Click anywhere on a row to open the detail modal (consistent UX
+      // with cards). Use mousedown-to-mouseup distance check so users can
+      // still select text without accidentally opening the modal.
+      let downX = null, downY = null;
+      tr.addEventListener('mousedown', (e) => { downX = e.clientX; downY = e.clientY; });
+      tr.addEventListener('mouseup',   (e) => {
+        if (downX === null) return;
+        const moved = Math.hypot(e.clientX - downX, e.clientY - downY);
+        downX = downY = null;
+        if (moved > 4) return; // user was selecting text -> don't open
+        // Avoid stealing clicks from the th (drag) — only open on tbody rows.
+        openCardDetail(rowIdx);
+      });
       tbody.appendChild(tr);
     });
     table.appendChild(tbody);
     return table;
+  }
+
+  // Move column `src` to before/after column `target` in columnOrder.
+  function moveColumn(src, target, before) {
+    if (src === target) return;
+    const order = columnOrder.slice();
+    const sIdx = order.indexOf(src);
+    if (sIdx < 0) return;
+    order.splice(sIdx, 1);
+    let tIdx = order.indexOf(target);
+    if (tIdx < 0) tIdx = order.length;
+    order.splice(before ? tIdx : tIdx + 1, 0, src);
+    columnOrder = order;
   }
 
   // Pick a "title-ish" column for cards: looks for names like title/name/
@@ -544,12 +680,12 @@
     const descIdx  = descCol ? columns.indexOf(descCol) : -1;
     const locIdx   = locCol  ? columns.indexOf(locCol)  : -1;
 
-    // Indices we've handled specially — used to filter the metadata footer.
-    const usedIdx = new Set([titleIdx, dateIdx, descIdx, locIdx].filter((i) => i >= 0));
-
-    rows.forEach((r) => {
+    rows.forEach((r, rowIdx) => {
       const card = document.createElement('article');
-      card.className = 'result-card';
+      card.className = 'result-card result-card-clickable';
+      card.tabIndex = 0;
+      card.setAttribute('role', 'button');
+      card.setAttribute('aria-label', 'View full details for ' + formatCell(r[titleIdx]));
       if (descIdx < 0) card.classList.add('no-desc');
 
       // ----- header: title + optional date pill -----
@@ -581,53 +717,209 @@
         card.appendChild(loc);
       }
 
-      // ----- big description body -----
+      // ----- description teaser (clamped) -----
       if (descIdx >= 0) {
-        const descLabel = document.createElement('div');
-        descLabel.className = 'result-card-desc-label';
-        descLabel.textContent = descCol;
-        const desc = document.createElement('div');
-        desc.className = 'result-card-desc';
+        const desc = document.createElement('p');
+        desc.className = 'result-card-desc-teaser';
         const v = r[descIdx];
         if (v === null || v === undefined || v === '') {
           desc.textContent = 'No ' + descCol.toLowerCase() + '.';
           desc.classList.add('null');
         } else {
           desc.textContent = String(v);
-          desc.title = String(v);
         }
-        card.append(descLabel, desc);
+        card.appendChild(desc);
       }
 
-      // ----- footer: remaining metadata as dt/dd pairs -----
-      const remaining = columns
-        .map((c, i) => ({ c, i }))
-        .filter(({ i }) => !usedIdx.has(i));
+      // ----- footer: "View details" hint -----
+      const footer = document.createElement('div');
+      footer.className = 'result-card-footer';
+      const usedSet = new Set([titleIdx, dateIdx, descIdx, locIdx].filter((i) => i >= 0));
+      const moreCount = columns.length - usedSet.size;
+      const moreText = moreCount > 0
+        ? `+${moreCount} more field${moreCount === 1 ? '' : 's'}`
+        : 'View details';
+      const moreLabel = document.createElement('span');
+      moreLabel.className = 'result-card-more';
+      moreLabel.textContent = moreText;
+      const arrow = document.createElement('span');
+      arrow.className = 'result-card-arrow';
+      arrow.innerHTML = '→';
+      footer.append(moreLabel, arrow);
+      card.appendChild(footer);
 
-      if (remaining.length) {
-        const body = document.createElement('dl');
-        body.className = 'result-card-body';
-        remaining.forEach(({ c, i }) => {
-          const dt = document.createElement('dt');
-          dt.textContent = c;
-          const dd = document.createElement('dd');
-          const v = r[i];
-          if (v === null || v === undefined || v === '') {
-            dd.textContent = '—';
-            dd.classList.add('null');
-          } else {
-            dd.textContent = String(v);
-            dd.title = String(v);
-          }
-          body.append(dt, dd);
-        });
-        card.appendChild(body);
-      }
+      // ----- click / keyboard activation -----
+      card.addEventListener('click', () => openCardDetail(rowIdx));
+      card.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          openCardDetail(rowIdx);
+        }
+      });
 
       wrap.appendChild(card);
     });
     return wrap;
   }
+
+  // ---------- card detail modal (zoom view) ----------------------------
+  // Opens the row with the given index in the *currently displayed* (sorted)
+  // result. Keeps modalRowIndex so prev/next can walk through the result.
+  function openCardDetail(rowIdx) {
+    if (!lastResult) return;
+    const sorted = sortedRows(lastResult);
+    if (rowIdx < 0 || rowIdx >= sorted.length) return;
+    modalRowIndex = rowIdx;
+    renderCardDetail();
+    cardModal.hidden = false;
+    cardModal.setAttribute('aria-hidden', 'false');
+    // Force a reflow so the .open transition actually plays.
+    void cardModal.offsetWidth;
+    cardModal.classList.add('open');
+    // Lock body scroll while open.
+    document.body.classList.add('modal-open');
+    // Focus the close button for keyboard users.
+    setTimeout(() => cardModalClose.focus(), 50);
+  }
+
+  function closeCardDetail() {
+    cardModal.classList.remove('open');
+    cardModal.setAttribute('aria-hidden', 'true');
+    document.body.classList.remove('modal-open');
+    // Hide after the transition so focus / tab order is correct.
+    setTimeout(() => { if (!cardModal.classList.contains('open')) cardModal.hidden = true; }, 200);
+    modalRowIndex = -1;
+  }
+
+  function stepCardDetail(delta) {
+    if (!lastResult) return;
+    const sorted = sortedRows(lastResult);
+    const next = modalRowIndex + delta;
+    if (next < 0 || next >= sorted.length) return;
+    modalRowIndex = next;
+    renderCardDetail();
+  }
+
+  function renderCardDetail() {
+    if (!lastResult || modalRowIndex < 0) return;
+    const res = lastResult;
+    const sorted = sortedRows(res);
+    const row = sorted[modalRowIndex];
+    if (!row) return;
+
+    const columns = res.columns;
+    const titleCol = pickTitleCol(columns);
+    const dateCol  = pickDateCol(columns);
+    const descCol  = pickDescCol(columns);
+    const locCol   = pickLocationCol(columns);
+    const titleIdx = columns.indexOf(titleCol);
+    const dateIdx  = dateCol ? columns.indexOf(dateCol) : -1;
+    const descIdx  = descCol ? columns.indexOf(descCol) : -1;
+    const locIdx   = locCol  ? columns.indexOf(locCol)  : -1;
+    const used = new Set([titleIdx, dateIdx, descIdx, locIdx].filter((i) => i >= 0));
+
+    // Build the modal body fresh each step.
+    cardModalBody.innerHTML = '';
+
+    // Eyebrow with row number ("Result 3 of 47")
+    const eyebrow = document.createElement('div');
+    eyebrow.className = 'card-modal-eyebrow';
+    eyebrow.textContent = `Result ${modalRowIndex + 1} of ${sorted.length}`;
+    cardModalBody.appendChild(eyebrow);
+
+    // Title (set on the dialog for aria-labelledby)
+    const titleEl = document.createElement('h2');
+    titleEl.id = 'card-modal-title';
+    titleEl.className = 'card-modal-title';
+    titleEl.textContent = formatCell(row[titleIdx]);
+    cardModalBody.appendChild(titleEl);
+
+    // Meta row: date pill + location
+    const meta = document.createElement('div');
+    meta.className = 'card-modal-meta';
+    if (dateIdx >= 0 && dateIdx !== titleIdx) {
+      const d = document.createElement('span');
+      d.className = 'card-modal-date';
+      d.innerHTML = '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 1v2M12 1v2M2 6h12M3 3h10a1 1 0 011 1v10a1 1 0 01-1 1H3a1 1 0 01-1-1V4a1 1 0 011-1z" stroke="currentColor" stroke-width="1.3" fill="none"/></svg> ';
+      const t = document.createElement('span');
+      t.textContent = formatCell(row[dateIdx]);
+      d.appendChild(t);
+      meta.appendChild(d);
+    }
+    if (locIdx >= 0 && locIdx !== titleIdx && locIdx !== dateIdx) {
+      const l = document.createElement('span');
+      l.className = 'card-modal-location';
+      l.innerHTML = '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 1c2.8 0 5 2.2 5 5 0 3.5-5 9-5 9S3 9.5 3 6c0-2.8 2.2-5 5-5z" stroke="currentColor" stroke-width="1.3" fill="none"/><circle cx="8" cy="6" r="1.7" fill="currentColor"/></svg> ';
+      const t = document.createElement('span');
+      t.textContent = formatCell(row[locIdx]);
+      l.appendChild(t);
+      meta.appendChild(l);
+    }
+    if (meta.childNodes.length) cardModalBody.appendChild(meta);
+
+    // Big description (full text, scrollable inside the modal body).
+    if (descIdx >= 0) {
+      const descLabel = document.createElement('div');
+      descLabel.className = 'card-modal-section-label';
+      descLabel.textContent = descCol;
+      const desc = document.createElement('div');
+      desc.className = 'card-modal-desc';
+      const v = row[descIdx];
+      if (v === null || v === undefined || v === '') {
+        desc.textContent = 'No ' + descCol.toLowerCase() + '.';
+        desc.classList.add('null');
+      } else {
+        desc.textContent = String(v);
+      }
+      cardModalBody.append(descLabel, desc);
+    }
+
+    // All remaining fields in a grid (using user's columnOrder).
+    const display = orderedColumns(columns);
+    const remaining = display.filter(({ srcIdx }) => !used.has(srcIdx));
+    if (remaining.length) {
+      const allLabel = document.createElement('div');
+      allLabel.className = 'card-modal-section-label';
+      allLabel.textContent = 'All fields';
+      cardModalBody.appendChild(allLabel);
+
+      const grid = document.createElement('dl');
+      grid.className = 'card-modal-grid';
+      remaining.forEach(({ name, srcIdx }) => {
+        const dt = document.createElement('dt');
+        dt.textContent = name;
+        const dd = document.createElement('dd');
+        const v = row[srcIdx];
+        if (v === null || v === undefined || v === '') {
+          dd.textContent = '—';
+          dd.classList.add('null');
+        } else {
+          dd.textContent = String(v);
+        }
+        grid.append(dt, dd);
+      });
+      cardModalBody.appendChild(grid);
+    }
+
+    // Update prev/next button states and counter
+    cardModalPrev.disabled = (modalRowIndex === 0);
+    cardModalNext.disabled = (modalRowIndex >= sorted.length - 1);
+    cardModalCount.textContent = `${modalRowIndex + 1} / ${sorted.length}`;
+  }
+
+  // Modal event wiring
+  cardModalClose.addEventListener('click', closeCardDetail);
+  cardModalPrev .addEventListener('click', () => stepCardDetail(-1));
+  cardModalNext .addEventListener('click', () => stepCardDetail(+1));
+  cardModal.addEventListener('click', (e) => {
+    if (e.target.dataset && e.target.dataset.close === '1') closeCardDetail();
+  });
+  document.addEventListener('keydown', (e) => {
+    if (cardModal.hidden) return;
+    if (e.key === 'Escape')     { e.preventDefault(); closeCardDetail(); }
+    else if (e.key === 'ArrowLeft')  { stepCardDetail(-1); }
+    else if (e.key === 'ArrowRight') { stepCardDetail(+1); }
+  });
 
   function formatCell(v) {
     if (v === null || v === undefined || v === '') return '—';
@@ -649,7 +941,11 @@
   exportBtn.addEventListener('click', () => {
     if (!lastResult || !lastResult.rows.length) return;
     const rows = sortedRows(lastResult);
-    const csv = toCsv(lastResult.columns, rows);
+    // Honour the user's column order in the exported file.
+    const display = orderedColumns(lastResult.columns);
+    const headers = display.map((d) => d.name);
+    const reordered = rows.map((r) => display.map(({ srcIdx }) => r[srcIdx]));
+    const csv = toCsv(headers, reordered);
     const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
