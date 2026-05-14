@@ -3,7 +3,12 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Data Query Tool</title>
+  <title>Data Query Tool — Filter & explore tables</title>
+  <meta name="description" content="Load CSV, XLSX, JSON, XML, SQLite, or Access files and query them with a friendly filter builder." />
+
+  <!-- Favicon: a table grid with a magnifying glass, inlined as SVG -->
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect x='3' y='3' width='20' height='20' rx='3' fill='%232563eb'/><path d='M3 10h20M3 16h20M9 3v20M16 3v20' stroke='white' stroke-width='1.5' opacity='0.85'/><circle cx='23' cy='23' r='5.5' fill='white' stroke='%232563eb' stroke-width='2'/><line x1='26.5' y1='26.5' x2='29.5' y2='29.5' stroke='%232563eb' stroke-width='2.5' stroke-linecap='round'/></svg>" />
+
   <link rel="stylesheet" href="/css/styles.css" />
 
   <!-- Third-party libraries (loaded from CDN) -->
@@ -15,14 +20,22 @@
   <header class="topbar">
     <div class="topbar-inner">
       <div class="brand">
-        <span class="brand-mark">▦</span>
-        <span class="brand-name">Data Query Tool</span>
+        <svg class="brand-mark" viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+          <rect x="3" y="3" width="20" height="20" rx="3" fill="currentColor"/>
+          <path d="M3 10h20M3 16h20M9 3v20M16 3v20" stroke="white" stroke-width="1.5" opacity="0.85"/>
+          <circle cx="23" cy="23" r="5.5" fill="white" stroke="currentColor" stroke-width="2"/>
+          <line x1="26.5" y1="26.5" x2="29.5" y2="29.5" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/>
+        </svg>
+        <div class="brand-text">
+          <span class="brand-name">Data Query Tool</span>
+          <span class="brand-tagline">Filter &amp; explore your tables</span>
+        </div>
       </div>
       <div class="topbar-actions">
         <label for="file-input" class="btn btn-primary">
           <span>＋ Load file</span>
           <input id="file-input" type="file" multiple
-                 accept=".csv,.tsv,.txt,.xlsx,.xls,.xml,.json,.db,.sqlite,.sqlite3" />
+                 accept=".csv,.tsv,.txt,.xlsx,.xls,.xml,.json,.db,.sqlite,.sqlite3,.accdb,.mdb" />
         </label>
         <button id="reset-btn" class="btn btn-ghost" title="Clear all loaded data">Reset</button>
       </div>
@@ -58,9 +71,24 @@
       <!-- Drop zone shown until first file -->
       <div id="dropzone" class="dropzone">
         <div class="dropzone-inner">
-          <div class="dropzone-icon">⤓</div>
+          <div class="dropzone-icon" aria-hidden="true">
+            <svg viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg">
+              <path d="M32 8v34M20 30l12 12 12-12" stroke="currentColor" stroke-width="3" fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+              <path d="M10 46v6a4 4 0 0 0 4 4h36a4 4 0 0 0 4-4v-6" stroke="currentColor" stroke-width="3" fill="none" stroke-linecap="round"/>
+            </svg>
+          </div>
           <h3>Drop a file here, or click <em>Load file</em></h3>
-          <p>CSV, TSV, XLSX, XLS, XML, JSON, SQLite (.db / .sqlite)</p>
+          <p class="dropzone-hint">Pick from your computer or drag &amp; drop — everything happens in your browser.</p>
+          <div class="dropzone-formats">
+            <span class="format-pill">CSV</span>
+            <span class="format-pill">TSV</span>
+            <span class="format-pill">XLSX</span>
+            <span class="format-pill">XLS</span>
+            <span class="format-pill">JSON</span>
+            <span class="format-pill">XML</span>
+            <span class="format-pill">SQLite</span>
+            <span class="format-pill format-pill-new">Access</span>
+          </div>
         </div>
       </div>
 
@@ -76,6 +104,21 @@
                 <select id="active-table" class="select"></select>
               </label>
             </div>
+          </div>
+
+          <div class="column-picker" id="column-picker">
+            <div class="column-picker-head">
+              <span class="column-picker-label">Columns to show:</span>
+              <div class="column-picker-actions">
+                <div class="lang-filter" role="tablist" aria-label="Language filter">
+                  <button id="lang-all"    class="lang-btn active" type="button" data-lang="all"     title="Show columns in any language">All</button>
+                  <button id="lang-en"     class="lang-btn"        type="button" data-lang="english" title="Keep only English columns (hide columns with 'hebrew' in the name)">English only</button>
+                  <button id="lang-he"     class="lang-btn"        type="button" data-lang="hebrew"  title="Keep only Hebrew columns (hide columns with 'english' in the name)">Hebrew only</button>
+                </div>
+                <button id="cols-select-all" class="btn btn-ghost btn-sm" type="button">Show all</button>
+              </div>
+            </div>
+            <div id="column-chips" class="column-chips"></div>
           </div>
 
           <div id="filter-builder" class="filter-builder"></div>
@@ -95,8 +138,15 @@
             </div>
           </div>
           <textarea id="sql-output" class="sql-output" readonly spellcheck="false"></textarea>
-          <div class="filter-toolbar">
-            <button id="run-query" class="btn btn-primary">▶ Run query</button>
+          <div class="filter-toolbar run-toolbar">
+            <button id="run-query" class="btn btn-primary">
+              <span class="run-icon" aria-hidden="true">▶</span>
+              <span class="run-label">Run query</span>
+              <span class="run-spinner" aria-hidden="true"></span>
+            </button>
+            <span class="kbd-hint" aria-hidden="true">
+              <kbd>Ctrl</kbd>+<kbd>Enter</kbd>
+            </span>
             <span id="result-meta" class="result-meta"></span>
           </div>
         </div>
@@ -105,6 +155,10 @@
           <div class="panel-head">
             <h2>Results</h2>
             <div class="panel-actions">
+              <div class="view-toggle" role="tablist" aria-label="Result view">
+                <button id="view-table" class="view-toggle-btn active" type="button" role="tab" aria-selected="true">Table</button>
+                <button id="view-cards" class="view-toggle-btn" type="button" role="tab" aria-selected="false">Cards</button>
+              </div>
               <button id="export-csv" class="btn btn-ghost btn-sm" disabled>Export CSV</button>
             </div>
           </div>

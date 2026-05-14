@@ -36,6 +36,10 @@
       case 'xml':
         return { tables: [parseXml(await file.text(), baseName)] };
 
+      case 'accdb':
+      case 'mdb':
+        return { tables: await parseAccess(await file.arrayBuffer(), baseName) };
+
       default:
         throw new Error(`Unsupported file extension: .${ext}`);
     }
@@ -178,6 +182,142 @@
       }
     }
     return obj;
+  }
+
+  // ---------- Access (ACCDB / MDB) -------------------------------------
+  // Uses `mdb-reader` (pure JS, no native deps) loaded lazily the first
+  // time the user drops an Access file. Read-only.
+  //
+  // mdb-reader's browser bundle expects Node-style `Buffer` objects (it
+  // calls `.copy()`, `.readUInt16LE()`, etc.), which plain Uint8Arrays
+  // don't have. So we also load the `buffer` polyfill and wrap the file
+  // bytes in a real Buffer before handing them off.
+
+  let _mdbReaderPromise = null;
+
+  // Try each URL in order; resolve with the first successful import.
+  async function tryImport(urls, label) {
+    let lastErr;
+    for (const url of urls) {
+      try {
+        return await import(url);
+      } catch (err) {
+        lastErr = err;
+        console.warn(`[parser] ${label}: import failed for ${url} →`, err && err.message);
+      }
+    }
+    const wrapped = new Error(`Could not load ${label} from any CDN.`);
+    wrapped.cause = lastErr;
+    throw wrapped;
+  }
+
+  function loadMdbReader() {
+    if (_mdbReaderPromise) return _mdbReaderPromise;
+    _mdbReaderPromise = (async () => {
+      // 1. Buffer polyfill — needed to construct Node-style Buffers in the
+      //    browser. esm.sh and jsdelivr both host the standard `buffer` pkg.
+      const bufferMod = await tryImport([
+        'https://esm.sh/buffer@6.0.3',
+        'https://cdn.jsdelivr.net/npm/buffer@6.0.3/+esm',
+        'https://unpkg.com/buffer@6.0.3/index.js',
+      ], 'Buffer polyfill');
+      const BufferCtor = bufferMod.Buffer || (bufferMod.default && bufferMod.default.Buffer);
+      if (typeof BufferCtor !== 'function') {
+        throw new Error('Buffer polyfill loaded but no `Buffer` export found.');
+      }
+      // Expose globally so mdb-reader's bundled code can find it if its own
+      // bundling didn't inline the polyfill.
+      if (typeof globalThis.Buffer === 'undefined') globalThis.Buffer = BufferCtor;
+
+      // 2. mdb-reader itself (browser bundle, with deps bundled in via ?bundle).
+      const mdbMod = await tryImport([
+        'https://esm.sh/mdb-reader@3.2.0?bundle',
+        'https://cdn.jsdelivr.net/npm/mdb-reader@3.2.0/+esm',
+        'https://esm.sh/mdb-reader@3?bundle',
+      ], 'mdb-reader');
+      const MDBReader = mdbMod.default || mdbMod.MDBReader || mdbMod;
+      if (typeof MDBReader !== 'function') {
+        throw new Error('mdb-reader loaded but no constructor was exported.');
+      }
+      return { MDBReader, Buffer: BufferCtor };
+    })();
+    return _mdbReaderPromise;
+  }
+
+  async function parseAccess(arrayBuffer, baseName) {
+    let MDBReader, Buffer;
+    try {
+      ({ MDBReader, Buffer } = await loadMdbReader());
+    } catch (err) {
+      const cause = (err && err.cause) ? (err.cause.message || String(err.cause)) : '';
+      throw new Error(
+        'Could not load the Access-reader library. This usually means you are ' +
+        'offline, or your network blocks all three of esm.sh, jsdelivr, and ' +
+        'unpkg. Try a different network — or vendor mdb-reader locally as ' +
+        'described in the README. ' +
+        (cause ? ('Underlying error: ' + cause) : '')
+      );
+    }
+
+    let reader;
+    try {
+      // Convert the file bytes into a Node-style Buffer so mdb-reader's
+      // internal calls (.copy / .readUInt16LE / .slice) work.
+      const buf = Buffer.from(new Uint8Array(arrayBuffer));
+      reader = new MDBReader(buf);
+    } catch (err) {
+      throw new Error(
+        'This file could not be opened as an Access database (.accdb / .mdb). ' +
+        'It may be corrupt, password-protected, or in an unsupported format. ' +
+        'Underlying error: ' + (err && err.message ? err.message : String(err))
+      );
+    }
+
+    const tableNames = reader.getTableNames();
+    if (!tableNames.length) {
+      throw new Error('Access database contains no user tables.');
+    }
+
+    const tables = [];
+    for (const tName of tableNames) {
+      let t;
+      try { t = reader.getTable(tName); }
+      catch (_) { continue; } // skip tables we can't read (e.g. linked / unsupported)
+
+      // Use getColumns() when available (mdb-reader exposes full Column objects);
+      // fall back to getColumnNames() for forward-compat with any API tweak.
+      let columns;
+      if (typeof t.getColumns === 'function') {
+        columns = t.getColumns().map((c) => c.name);
+      } else if (typeof t.getColumnNames === 'function') {
+        columns = t.getColumnNames();
+      } else {
+        continue;
+      }
+
+      const rawRows = t.getData(); // array of plain objects keyed by column name
+      // Normalise: dates -> ISO strings, nested objects -> JSON, so each value
+      // can be stored in a SQLite column without losing information.
+      const rows = rawRows.map((r) => {
+        const out = {};
+        for (const k of columns) {
+          const v = r[k];
+          if (v instanceof Date)                out[k] = v.toISOString();
+          else if (v && typeof v === 'object')  out[k] = JSON.stringify(v);
+          else                                  out[k] = v;
+        }
+        return out;
+      });
+      const finalName = tableNames.length === 1
+        ? sanitizeName(baseName)
+        : sanitizeName(`${baseName}__${tName}`);
+      tables.push({ name: finalName, columns, rows });
+    }
+
+    if (!tables.length) {
+      throw new Error('Access database could not be read (no supported tables).');
+    }
+    return tables;
   }
 
   // ---------- helpers ---------------------------------------------------
